@@ -1,1 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>EduTalk — Home</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/style.css?v=7" />
+  <style>
+    .badge{ font-size:12px; padding:2px 8px; background:#13213b; color:#a9b6d3; border-radius:999px; }
+    .btn{ padding:8px 12px; background:#1a3a8a; color:#fff; border-radius:8px; text-decoration:none; display:inline-flex; gap:6px; align-items:center; border:none; cursor:pointer; }
+    .btn-outline{ background:transparent; border:1px solid #28427a; }
+    .btn.danger{ background:#9b1c1c; }
+  </style>
+</head>
+<body>
+  <header class="nav">
+    <h1><a href="/" style="color:inherit;text-decoration:none">EduTalk VideoShare</a></h1>
+    <nav style="display:flex;gap:10px;align-items:center">
+      <span class="badge" id="roleBadge">Guest</span>
+      <button id="btnRole"   class="btn"        type="button" style="display:none" title="Switch between Consumer and Creator">Switch Role</button>
+      <button id="btnSignIn" class="btn"        type="button">Sign in</button>
+      <button id="btnSignOut"class="btn danger" type="button" style="display:none">Sign out</button>
+      <a class="btn btn-outline" href="/videos.html">All Videos</a>
+      <a class="btn btn-outline" id="uploadLink" href="/upload.html" style="display:none">Upload</a>
+    </nav>
+  </header>
 
+  <main class="container">
+    <section class="hero card">
+      <h2 style="margin:0 0 8px">Welcome to EduTalk</h2>
+      <p class="muted" style="margin:0">
+        Browse the latest educational videos. Creators can upload with title, publisher, producer, genre, and age rating.
+      </p>
+      <div style="margin-top:12px;display:flex;gap:10px">
+        <a class="btn" href="/videos.html">Browse All</a>
+        <a class="btn btn-outline" id="ctaUpload" href="/upload.html" style="display:none">Upload</a>
+      </div>
+      <p id="authMsg" class="muted" style="margin-top:8px"></p>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0">Latest videos</h2>
+      <div id="latest" class="grid-cards"></div>
+      <p id="latestStatus" class="muted"></p>
+    </section>
+  </main>
+
+  <footer class="footer">© EduTalk</footer>
+
+  <!-- MSAL (browser) -->
+  <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
+  <script>
+    /***********************
+     * 1) MSAL config
+     *    👉 Put your real IDs below
+     ***********************/
+    const TENANT_ID = "YOUR_TENANT_ID";
+    const CLIENT_ID = "YOUR_CLIENT_ID";
+
+    const msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId: CLIENT_ID,
+        authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+        redirectUri: window.location.origin
+      },
+      cache: { cacheLocation: "localStorage" }
+    });
+
+    // local storage for id token a.k.a. proof of login
+    let ID_TOKEN = localStorage.getItem("EDUTALK_ID_TOKEN") || null;
+    let ME = null; // { email, name, role }
+
+    function authz(extra={}) {
+      const t = ID_TOKEN || localStorage.getItem("EDUTALK_ID_TOKEN") || "";
+      return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
+    }
+
+    /***********************
+     * 2) Sign in / out
+     ***********************/
+    async function signIn(){
+      try {
+        const login = await msalInstance.loginPopup({ scopes:["openid","profile","email"] });
+        const account = login.account;
+        const token = await msalInstance.acquireTokenSilent({ account, scopes:["openid","profile","email"] });
+        ID_TOKEN = token.idToken;
+        localStorage.setItem("EDUTALK_ID_TOKEN", ID_TOKEN);
+        await refreshMe();
+        renderAuthUI();
+      } catch (e) {
+        console.error(e);
+        document.getElementById("authMsg").textContent = "Sign in failed: " + (e.message||e);
+      }
+    }
+
+    async function signOut(){
+      try {
+        const account = msalInstance.getAllAccounts()[0];
+        localStorage.removeItem("EDUTALK_ID_TOKEN");
+        ID_TOKEN = null; ME = null;
+        await msalInstance.logoutPopup({ account });
+      } catch {}
+      renderAuthUI();
+    }
+
+    /***********************
+     * 3) Role: fetch & switch
+     ***********************/
+    async function refreshMe(){
+      try{
+        const res = await fetch("/me", { headers: authz({ "Accept":"application/json" }) });
+        if (!res.ok) { ME = null; return; }
+        const data = await res.json();
+        ME = data.user || null;
+      }catch{ ME = null; }
+    }
+
+    async function switchRole(){
+      if (!ME) return alert("Sign in first.");
+      const target = ME.role === "Creator" ? "Consumer" : "Creator";
+      try{
+        const res = await fetch("/me/role", {
+          method: "POST",
+          headers: authz({ "Content-Type":"application/json" }),
+          body: JSON.stringify({ role: target })
+        });
+        if (!res.ok) {
+          const t = await res.text();
+          alert("Role change failed: " + t);
+          return;
+        }
+        await refreshMe();
+        renderAuthUI();
+      }catch(e){ alert("Role change failed: " + e.message); }
+    }
+
+    function renderAuthUI(){
+      const signed = !!(ID_TOKEN || localStorage.getItem("EDUTALK_ID_TOKEN"));
+      const role = ME?.role || "Guest";
+      document.getElementById("roleBadge").textContent = role;
+
+      document.getElementById("btnSignIn").style.display  = signed ? "none" : "inline-flex";
+      document.getElementById("btnSignOut").style.display = signed ? "inline-flex" : "none";
+      document.getElementById("btnRole").style.display    = signed ? "inline-flex" : "none";
+
+      // Only Creators see Upload links
+      const showUpload = (role === "Creator");
+      document.getElementById("uploadLink").style.display = showUpload ? "inline-flex" : "none";
+      document.getElementById("ctaUpload").style.display  = showUpload ? "inline-flex" : "none";
+
+      // helper message
+      document.getElementById("authMsg").textContent =
+        signed ? (showUpload ? "You can upload videos." : "Switch to Creator to upload.")
+               : "Sign in to rate, comment, or upload.";
+    }
+
+    // wire buttons
+    document.getElementById("btnSignIn").addEventListener("click", signIn);
+    document.getElementById("btnSignOut").addEventListener("click", signOut);
+    document.getElementById("btnRole").addEventListener("click", switchRole);
+
+    // boot
+    (async ()=>{
+      renderAuthUI();
+      if (ID_TOKEN) { await refreshMe(); renderAuthUI(); }
+    })();
+  </script>
+
+  <script>
+    /***********************
+     * Latest videos (unchanged)
+     ***********************/
+    const esc = (s='') => String(s)
+      .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+      .replaceAll('"','&quot;').replaceAll("'","&#39;");
+
+    function ytId(url=''){
+      try{
+        const u = new URL(url);
+        if (u.hostname.includes('youtu.be')) return u.pathname.slice(1);
+        if (u.hostname.includes('youtube.com')){
+          if (u.searchParams.get('v')) return u.searchParams.get('v');
+          const p = u.pathname.split('/'); const i = p.indexOf('embed');
+          if (i !== -1 && p[i+1]) return p[i+1];
+        }
+      }catch{}
+      return null;
+    }
+
+    function ytEmbed(id){
+      const src = `https://www.youtube.com/embed/${id}?rel=0&modestbranding=1&playsinline=1`;
+      return `<iframe class="player" src="${src}" title="YouTube player" frameborder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>`;
+    }
+
+    function renderLatest(items){
+      const box = document.getElementById('latest');
+      const status = document.getElementById('latestStatus');
+
+      const latest = (Array.isArray(items)?items:[])
+        .slice()
+        .sort((a,b)=>new Date(b.createdAt||0)-new Date(a.createdAt||0))
+        .slice(0,6);
+
+      if (!latest.length){
+        status.textContent = 'No videos yet.';
+        box.innerHTML = '';
+        return;
+      }
+
+      status.textContent = '';
+      box.innerHTML = latest.map(v=>{
+        const id = ytId(v.playbackUrl||'');
+        const player = id
+          ? ytEmbed(id)
+          : (v.playbackUrl
+              ? `<video class="player" src="${esc(v.playbackUrl)}" controls preload="metadata"></video>`
+              : '');
+
+        return `<article class="card">
+          ${player}
+          <h3 style="margin:8px 0 4px">${esc(v.title || 'Untitled')}</h3>
+          <p class="muted" style="margin:0">${esc(v.publisher || '')}</p>
+        </article>`;
+      }).join('');
+    }
+
+    (async ()=>{
+      const status = document.getElementById('latestStatus');
+      try{
+        const res = await fetch('/videos?ts=' + Date.now(), {
+          headers: { 'Accept':'application/json', 'Cache-Control':'no-cache' }
+        });
+        const txt = await res.text();
+        if (!res.ok){ status.textContent = `HTTP ${res.status}: ${txt.slice(0,160)}`; return; }
+        let data; try { data = JSON.parse(txt); } catch { status.textContent = 'Invalid JSON'; return; }
+        renderLatest(data);
+      }catch(e){
+        status.textContent = 'Could not load latest videos: ' + e.message;
+        console.error(e);
+      }
+    })();
+  </script>
+</body>
+</html>

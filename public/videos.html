@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Latest Videos — EduTalk</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="x-api-key" content="CREATOR_API_KEY" />
+  <link rel="stylesheet" href="/style.css?v=7" />
+  <style>
+    .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0 14px; }
+    .toolbar input[type="search"]{ padding:8px 10px; border:1px solid #20314f; background:#0a0f20; color:#e8eefc; border-radius:8px; min-width:240px; }
+    .toolbar .btn { padding:8px 12px; background:#1a3a8a; color:#fff; border-radius:8px; text-decoration:none; display:inline-flex; gap:6px; align-items:center; border:none; cursor:pointer; }
+    .toolbar .btn.danger { background:#9b1c1c; }
+    .meta { display:flex; gap:8px; flex-wrap:wrap; margin:4px 0 10px; }
+    .badge { font-size:12px; padding:2px 8px; background:#13213b; color:#a9b6d3; border-radius:999px; }
+    .badge.youtube { background:#35213b; color:#f0b7ff; }
+    .muted-sm { color:#9aa3b2; font-size:12px; }
+    .player { width:100%; aspect-ratio:16/9; background:#0a0f20; border-radius:12px; }
+    .empty { color:#9aa3b2; padding:16px 0; }
+    .card-head { display:flex; gap:8px; align-items:center; justify-content:space-between; margin-bottom:6px; }
+    .row-actions { display:flex; gap:8px; align-items:center; }
+    .row-actions .btn { padding:6px 10px; font-size:13px; }
+    .row-actions .btn.danger { background:#8a1a1a; }
+    .controls { display:grid; gap:10px; margin-top:10px; }
+    .controls .row { display:flex; gap:8px; align-items:center; }
+    .controls select, .controls button, .controls textarea {
+      padding:8px 10px; border:1px solid #20314f; background:#0a0f20; color:#e8eefc; border-radius:10px;
+    }
+    .controls textarea { min-height:64px; width:100%; resize:vertical; }
+    .controls button { background:#1a3a8a; cursor:pointer; }
+    .controls button.secondary { background:#253a6b; }
+    .rating-line { font-size:13px; margin:8px 0; }
+    .comments { margin-top:10px; border-top:1px dashed #20314f; padding-top:8px; }
+    .comment { font-size:13px; padding:6px 0; border-bottom:1px dashed #182240; }
+  </style>
+</head>
+<body>
+  <header class="nav">
+    <h1><a href="/" style="color:inherit;text-decoration:none">EduTalk VideoShare</a></h1>
+    <nav style="display:flex;gap:10px;align-items:center">
+      <span class="badge" id="roleBadge">Guest</span>
+      <button id="btnRole" class="btn secondary" type="button" style="display:none" title="Switch between Consumer and Creator">Switch Role</button>
+      <button id="btnSignIn"  class="btn" type="button">Sign in</button>
+      <button id="btnSignOut" class="btn danger" type="button" style="display:none">Sign out</button>
+      <a href="/videos.html">All Videos</a>
+      <a href="/upload.html">Upload</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2 style="margin:0">Latest Videos</h2>
+
+      <div class="toolbar">
+        <input id="q" type="search" placeholder="Search title, publisher, genre…" />
+        <button id="sortBtn" class="btn" type="button" aria-label="Toggle sort order">Sort: Newest ↓</button>
+        <button id="delYT" class="btn danger only-creator" type="button" title="Remove all videos that are YouTube links" style="display:none">
+          Delete all YouTube links
+        </button>
+        <span id="status" class="muted"></span>
+      </div>
+
+      <div id="list" class="grid-cards"></div>
+      <p id="empty" class="empty" style="display:none">No videos match your filter.</p>
+    </section>
+  </main>
+
+  <footer class="footer">© EduTalk</footer>
+
+  <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
+  <script>
+    /***************
+     * Auth (MSAL)
+     ***************/
+    const TENANT_ID = "b0e4c77a-c53c-4cbc-8f97-72baebc755dd";
+    const CLIENT_ID = "7eaa59ec-154f-4bd9-8abd-fd453b0b1d76";
+
+    const msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId: CLIENT_ID,
+        authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+        redirectUri: window.location.origin
+      },
+      cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false }
+    });
+
+    // Clear any pending interaction so we don't get "interaction_in_progress"
+    // (safe for popup or redirect flows).
+    msalInstance.handleRedirectPromise().catch(() => { /* ignore */ });
+
+    let ID_TOKEN = localStorage.getItem("EDUTALK_ID_TOKEN") || null;
+    let ME = null;
+    let authInFlight = false; // <— debounce guard
+
+    function setSignInBusy(busy) {
+      const btn = document.getElementById('btnSignIn');
+      btn.disabled = busy;
+      btn.textContent = busy ? 'Signing in…' : 'Sign in';
+    }
+
+    async function signIn() {
+      if (authInFlight) return;
+      authInFlight = true;
+      setSignInBusy(true);
+      try {
+        const login = await msalInstance.loginPopup({ scopes: ["openid","profile","email"] });
+        const account = login.account || (msalInstance.getAllAccounts()[0] || null);
+        const tokenResp = await msalInstance.acquireTokenSilent({ account, scopes: ["openid","profile","email"] });
+        ID_TOKEN = tokenResp.idToken;
+        localStorage.setItem("EDUTALK_ID_TOKEN", ID_TOKEN);
+        await refreshMe();
+        renderAuthUI();
+        await refreshList(); // update creator-only buttons immediately
+      } catch (e) {
+        alert("Sign in failed: " + (e && e.message ? e.message : e));
+      } finally {
+        authInFlight = false;
+        setSignInBusy(false);
+      }
+    }
+
+    async function signOut() {
+      try {
+        const acct = msalInstance.getAllAccounts()[0];
+        await msalInstance.logoutPopup(acct ? { account: acct } : {});
+      } catch {}
+      localStorage.removeItem("EDUTALK_ID_TOKEN");
+      ID_TOKEN = null;
+      ME = null;
+      renderAuthUI();
+      applyCreatorVisibility();
+    }
+
+    function authz(extra = {}) {
+      const t = ID_TOKEN || localStorage.getItem("EDUTALK_ID_TOKEN") || "";
+      return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
+    }
+
+    async function refreshMe() {
+      try {
+        const res = await fetch("/me", { headers: authz({ Accept: "application/json" }) });
+        ME = res.ok ? (await res.json()).user : null;
+      } catch { ME = null; }
+      updateRoleBadge();
+    }
+
+    function updateRoleBadge() {
+      const b = document.getElementById("roleBadge");
+      b.textContent = ME ? ME.role : "Guest";
+      const btnRole = document.getElementById("btnRole");
+      btnRole.style.display = ME ? "inline-flex" : "none";
+      btnRole.textContent = ME && ME.role === "Creator" ? "Switch to Consumer" : "Switch to Creator";
+      applyCreatorVisibility();
+    }
+
+    async function switchRole() {
+      if (!ME) return alert("Please sign in first.");
+      const target = ME.role === "Creator" ? "Consumer" : "Creator";
+      const res = await fetch("/me/role", {
+        method: "POST",
+        headers: authz({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ role: target })
+      });
+      if (!res.ok) {
+        const t = await res.text(); alert("Role change failed: " + t.slice(0,200)); return;
+      }
+      await refreshMe();
+      applyCreatorVisibility();
+    }
+
+    function renderAuthUI() {
+      const signedIn = !!(ID_TOKEN || localStorage.getItem("EDUTALK_ID_TOKEN"));
+      document.getElementById("btnSignIn").style.display = signedIn ? "none" : "inline-flex";
+      document.getElementById("btnSignOut").style.display = signedIn ? "inline-flex" : "none";
+      updateRoleBadge();
+    }
+
+    function applyCreatorVisibility() {
+      const isCreator = ME && ME.role === "Creator";
+      document.querySelectorAll(".only-creator").forEach(el => {
+        el.style.display = isCreator ? "" : "none";
+      });
+      document.querySelectorAll('[data-role="delete-btn"]').forEach(el => {
+        el.style.display = isCreator ? "" : "none";
+      });
+    }
+  </script>
+
+  <script>
+    /***************
+     * Utilities
+     ***************/
+    const esc = (s='') => String(s)
+      .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+      .replaceAll('"','&quot;').replaceAll("'","&#39;");
+    const fmtDate = (d) => { try { const dt = new Date(d); return isNaN(+dt) ? '' : dt.toLocaleString(); } catch { return ''; } };
+    const avg = (arr=[]) => arr.length ? (arr.reduce((a,b)=>a+b,0)/arr.length) : 0;
+    const fmtAvg = (n) => n ? n.toFixed(1) : '—';
+
+    function getApiKey() {
+      const meta = document.querySelector('meta[name="x-api-key"]');
+      return (meta && meta.content) || (window.EDUTALK_API_KEY || '').trim();
+    }
+    function apiKeyHeaders(extra = {}) {
+      const key = getApiKey();
+      return key ? { ...extra, 'x-api-key': key } : extra;
+    }
+
+    function ytId(url='') {
+      try {
+        const u = new URL(url);
+        if (u.hostname.includes('youtu.be')) return u.pathname.slice(1);
+        if (u.hostname.includes('youtube.com')) {
+          if (u.searchParams.get('v')) return u.searchParams.get('v');
+          const parts = u.pathname.split('/'); const i = parts.indexOf('embed');
+          if (i !== -1 && parts[i+1]) return parts[i+1];
+        }
+      } catch {}
+      return null;
+    }
+    function ytEmbed(id){
+      const src = `https://www.youtube.com/embed/${id}?rel=0&modestbranding=1&playsinline=1`;
+      const poster = `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
+      return `<iframe class="player" src="${src}" title="YouTube player" loading="lazy"
+                style="background:url('${poster}') center/cover no-repeat"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>`;
+    }
+    function guessType(url=''){
+      const u = url.split('?')[0].toLowerCase();
+      if (u.endsWith('.mp4'))  return 'video/mp4';
+      if (u.endsWith('.webm')) return 'video/webm';
+      if (u.endsWith('.ogg') || u.endsWith('.ogv')) return 'video/ogg';
+      return 'video/mp4';
+    }
+
+    /***************
+     * Rendering
+     ***************/
+    let ALL = [];
+    let newestFirst = true;
+
+    function commentsHtml(v) {
+      if (!v.comments || !v.comments.length) return `<div class="muted-sm">No comments yet.</div>`;
+      return v.comments.slice().reverse().map(c => {
+        const when = c.createdAt ? ` <span class="muted-sm">(${fmtDate(c.createdAt)})</span>` : '';
+        return `<div class="comment">🗨️ ${esc(c.text)}${when}</div>`;
+      }).join('');
+    }
+
+    function ratingBlock(v) {
+      const a = avg(v.ratings || []);
+      const count = (v.ratings || []).length;
+      const id = esc(v._id);
+      return `
+        <div class="rating-line">⭐ <b>${fmtAvg(a)}</b> (${count} ratings)</div>
+        <div class="controls">
+          <div class="row">
+            <select id="rate-${id}" aria-label="Rate this video">
+              <option value="">Rate 1–5</option>
+              <option>5</option><option>4</option><option>3</option><option>2</option><option>1</option>
+            </select>
+            <button class="rate-btn" data-id="${id}">Submit Rating</button>
+          </div>
+          <div>
+            <textarea id="cmt-${id}" placeholder="Write a public comment…"></textarea>
+            <div class="row" style="margin-top:6px;">
+              <button class="comment-btn secondary" data-id="${id}">Post Comment</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function card(v){
+      const youId  = ytId(v.playbackUrl||'');
+      const player = youId
+        ? ytEmbed(youId)
+        : (v.playbackUrl
+            ? `<video class="player" controls preload="metadata" crossorigin="anonymous" playsinline>
+                 <source src="${esc(v.playbackUrl)}" type="${guessType(v.playbackUrl)}">
+                 Your browser does not support the video tag.
+               </video>`
+            : `<div class="player" style="display:flex;align-items:center;justify-content:center;color:#9aa3b2">No preview</div>`);
+
+      const badges = [
+        v.publisher && `<span class="badge">Publisher: ${esc(v.publisher)}</span>`,
+        v.producer  && `<span class="badge">Producer: ${esc(v.producer)}</span>`,
+        v.genre     && `<span class="badge">Genre: ${esc(v.genre)}</span>`,
+        v.age       && `<span class="badge">Age: ${esc(v.age)}</span>`,
+        youId       && `<span class="badge youtube">YouTube</span>`
+      ].filter(Boolean).join('');
+
+      const when = fmtDate(v.createdAt);
+
+      return `<article class="card" data-id="${esc(v._id)}">
+        <div class="card-head">
+          <h3 style="margin:0">${esc(v.title||'Untitled')}</h3>
+          <div class="row-actions">
+            <button class="btn danger only-creator" data-role="delete-btn" type="button" onclick="deleteVideo('${esc(v._id)}')" style="display:none">Delete</button>
+          </div>
+        </div>
+        <div class="meta">
+          ${badges || '<span class="muted-sm">No meta</span>'}
+          ${when ? `<span class="muted-sm">• ${esc(when)}</span>` : ''}
+        </div>
+        ${player}
+        ${ratingBlock(v)}
+        <div class="comments" aria-live="polite">
+          <h4 class="muted-sm" style="margin:8px 0 6px;">Comments</h4>
+          <div class="comments-list">${commentsHtml(v)}</div>
+        </div>
+      </article>`;
+    }
+
+    function applyFilter() {
+      const q = document.getElementById('q').value.trim().toLowerCase();
+      let list = [...ALL];
+
+      list.sort((a,b)=>{
+        const da = new Date(a.createdAt||0).getTime();
+        const db = new Date(b.createdAt||0).getTime();
+        return newestFirst ? (db - da) : (da - db);
+      });
+
+      if (q) {
+        list = list.filter(v => {
+          const hay = [v.title, v.publisher, v.producer, v.genre, v.age].map(x => (x||'').toLowerCase()).join(' ');
+          return hay.includes(q);
+        });
+      }
+
+      const wrap = document.getElementById('list');
+      const empty = document.getElementById('empty');
+
+      if (!list.length) { wrap.innerHTML = ''; empty.style.display = 'block'; }
+      else { empty.style.display = 'none'; wrap.innerHTML = list.map(card).join(''); }
+
+      const status = document.getElementById('status');
+      status.textContent = `${list.length} of ${ALL.length} video(s)`;
+
+      bindInteractions();
+      applyCreatorVisibility();
+    }
+
+    /***************
+     * Data + actions
+     ***************/
+    async function refreshList() {
+      const status = document.getElementById('status');
+      try {
+        status.textContent = 'Loading…';
+        const res = await fetch('/videos?ts=' + Date.now(), { headers: { 'Accept':'application/json','Cache-Control':'no-cache' } });
+        const txt = await res.text();
+        if (!res.ok) { status.textContent = `HTTP ${res.status}: ${txt.slice(0,160)}`; return; }
+        let data; try { data = JSON.parse(txt); } catch { status.textContent = 'Invalid JSON'; return; }
+        ALL = Array.isArray(data) ? data : [];
+        applyFilter();
+      } catch (e) {
+        status.textContent = 'Fetch error: ' + e.message;
+        console.error(e);
+      }
+    }
+
+    async function deleteVideo(id) {
+      if (!id) return;
+      if (!confirm('Delete this video? This cannot be undone.')) return;
+      const status = document.getElementById('status');
+      try {
+        status.textContent = 'Deleting…';
+        const res = await fetch(`/videos/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: { ...apiKeyHeaders({ 'Content-Type': 'application/json' }), ...authz() }
+        });
+        const txt = await res.text();
+        if (!res.ok) {
+          alert(`Delete failed: ${res.status} ${res.statusText}\n${txt.slice(0,180)}`);
+          status.textContent = 'Delete failed';
+          return;
+        }
+        await refreshList();
+        status.textContent = 'Deleted';
+      } catch (e) {
+        alert('Delete error: ' + e.message);
+        status.textContent = 'Delete error';
+      }
+    }
+
+    async function deleteAllYouTube() {
+      if (!confirm('Delete ALL videos that are YouTube links? This cannot be undone.')) return;
+      const status = document.getElementById('status');
+      try {
+        status.textContent = 'Bulk deleting…';
+        const res = await fetch('/videos?provider=youtube', {
+          method: 'DELETE',
+          headers: { ...apiKeyHeaders({ 'Content-Type': 'application/json' }), ...authz() }
+        });
+        const txt = await res.text();
+        if (!res.ok) {
+          alert(`Bulk delete failed: ${res.status} ${res.statusText}\n${txt.slice(0,180)}`);
+          status.textContent = 'Bulk delete failed';
+          return;
+        }
+        await refreshList();
+        status.textContent = 'YouTube videos deleted';
+      } catch (e) {
+        alert('Bulk delete error: ' + e.message);
+        status.textContent = 'Bulk delete error';
+      }
+    }
+
+    async function submitRating(id, value, btn) {
+      if (!value) { alert('Please select a rating 1–5.'); return; }
+      btn && (btn.disabled = true);
+      try {
+        const res = await fetch(`/videos/${encodeURIComponent(id)}/ratings`, {
+          method: 'POST',
+          headers: { 'Content-Type':'application/json' },
+          body: JSON.stringify({ value: Number(value) })
+        });
+        const txt = await res.text();
+        if (!res.ok) throw new Error((JSON.parse(txt).error)||txt);
+        const updated = JSON.parse(txt);
+        replaceCard(updated);
+      } catch (e) { alert('Rating failed: ' + e.message); }
+      finally { btn && (btn.disabled = false); }
+    }
+
+    async function submitComment(id, text, btn) {
+      const t = (text||'').trim();
+      if (!t) { alert('Comment cannot be empty.'); return; }
+      btn && (btn.disabled = true);
+      try {
+        const res = await fetch(`/videos/${encodeURIComponent(id)}/comments`, {
+          method: 'POST',
+          headers: { 'Content-Type':'application/json' },
+          body: JSON.stringify({ text: t })
+        });
+        const txt = await res.text();
+        if (!res.ok) throw new Error((JSON.parse(txt).error)||txt);
+        const updated = JSON.parse(txt);
+        replaceCard(updated);
+      } catch (e) { alert('Comment failed: ' + e.message); }
+      finally { btn && (btn.disabled = false); }
+    }
+
+    function replaceCard(v) {
+      const wrap = document.getElementById('list');
+      const node = wrap.querySelector(`article.card[data-id="${CSS.escape(v._id)}"]`);
+      if (!node) return;
+      node.outerHTML = card(v);
+      bindInteractions();
+      const idx = ALL.findIndex(x => x._id === v._id);
+      if (idx !== -1) ALL[idx] = v;
+      applyCreatorVisibility();
+    }
+
+    /***************
+     * Bootstrap
+     ***************/
+    (async () => {
+      renderAuthUI();
+      if (ID_TOKEN) await refreshMe();
+      await refreshList();
+
+      document.getElementById('btnSignIn').addEventListener('click', signIn);
+      document.getElementById('btnSignOut').addEventListener('click', signOut);
+      document.getElementById('btnRole').addEventListener('click', switchRole);
+
+      document.getElementById('q').addEventListener('input', applyFilter);
+      document.getElementById('sortBtn').addEventListener('click', (e)=>{
+        newestFirst = !newestFirst;
+        e.currentTarget.textContent = newestFirst ? 'Sort: Newest ↓' : 'Sort: Oldest ↑';
+        applyFilter();
+      });
+      document.getElementById('delYT').addEventListener('click', deleteAllYouTube);
+    })();
+
+    function bindInteractions() {
+      const wrap = document.getElementById('list');
+      wrap.querySelectorAll('.rate-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-id');
+          const sel = document.getElementById(`rate-${id}`);
+          submitRating(id, sel && sel.value, btn);
+        });
+      });
+      wrap.querySelectorAll('.comment-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-id');
+          const ta = document.getElementById(`cmt-${id}`);
+          submitComment(id, ta && ta.value, btn);
+        });
+      });
+    }
+
+    // expose for inline onclick
+    window.deleteVideo = deleteVideo;
+  </script>
+</body>
+</html>
