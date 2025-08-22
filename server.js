@@ -1,97 +1,99 @@
-// ---------- server.js ----------
+// ---------- server.js (Inspira) ----------
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const path = require("path");
 
-// NEW: JWT libs for Azure Entra (for identity only)
+// JWT libs for Azure Entra ID
 const { expressjwt: jwt } = require("express-jwt");
 const jwks = require("jwks-rsa");
 
 const app = express();
-app.use(cors());
+
+// ---------- Config & Env ----------
+const PORT = process.env.PORT || 8080;
+const STATIC_DIR = process.env.STATIC_DIR || "public";
+const CREATOR_API_KEY = process.env.CREATOR_API_KEY || "";
+const TENANT_ID = process.env.TENANT_ID || "";
+const CLIENT_ID = process.env.CLIENT_ID || "";
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+
+// Mongo: require env only (no hardcoded secret!)
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  console.error("❌ Missing MONGO_URI in environment. Set it in Azure → App Service → Configuration.");
+  process.exit(1);
+}
+
+// ---------- App Middleware ----------
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const MONGO_URI =
-  process.env.MONGO_URI ||
-  "mongodb+srv://edutalkUser:MyPass123@edutalk-cluster.n8jlomv.mongodb.net/edutalk?retryWrites=true&w=majority";
+// Strict CORS allowlist (fallback: allow all if ALLOWED_ORIGINS is empty)
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  credentials: false
+}));
 
-// You can keep this for emergency creator access during transition (not used for role logic)
-const CREATOR_API_KEY = process.env.CREATOR_API_KEY || "";
+// JWT middleware (public-friendly). If TENANT/CLIENT not set, skip but warn.
+if (TENANT_ID && CLIENT_ID) {
+  app.use(jwt({
+    secret: jwks.expressJwtSecret({
+      cache: true,
+      rateLimit: true,
+      jwksUri: `https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`,
+    }),
+    audience: CLIENT_ID,
+    issuer: `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+    algorithms: ["RS256"],
+    credentialsRequired: false,
+  }));
+} else {
+  console.warn("⚠️ TENANT_ID/CLIENT_ID not set. JWT verification disabled.");
+}
 
-// 🔐 Entra IDs from Azure App Service → Configuration
-const TENANT_ID = process.env.TENANT_ID || "<TENANT_ID>";
-const CLIENT_ID = process.env.CLIENT_ID || "<CLIENT_ID>";
-
-// --- DB ---
-mongoose
-  .connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+// ---------- DB ----------
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log("✅ Connected to MongoDB Atlas"))
-  .catch((err) =>
-    console.error("❌ MongoDB connection error:", err?.message || err)
-  );
+  .catch((err) => console.error("❌ MongoDB connection error:", err?.message || err));
 
-// ----- Schemas -----
-const commentSchema = new mongoose.Schema(
-  {
-    text: String,
-    createdAt: { type: Date, default: Date.now },
-    // NEW (optional metadata if user is signed in)
-    userId: { type: String, default: "" }, // Entra oid
-    userName: { type: String, default: "" },
-  },
-  { _id: false }
-);
+const dbState = () => (["disconnected","connected","connecting","disconnecting"][mongoose.connection.readyState] || "unknown");
 
-const videoSchema = new mongoose.Schema(
-  {
-    title: { type: String, required: true },
-    publisher: { type: String, default: "UNKNOWN" },
-    producer: { type: String, default: "UNKNOWN" },
-    genre: { type: String, default: "General" },
-    age: { type: String, default: "PG" },
-    playbackUrl: { type: String, required: true }, // either YT or MP4/WebM/Ogg
-    external: { type: Boolean, default: false },
-    comments: { type: [commentSchema], default: [] },
-    ratings: { type: [Number], default: [] },
-    createdAt: { type: Date, default: Date.now },
-  },
-  { collection: "videos" }
-);
+// ---------- Schemas ----------
+const commentSchema = new mongoose.Schema({
+  text: String,
+  createdAt: { type: Date, default: Date.now },
+  userId: { type: String, default: "" },     // Entra oid (optional)
+  userName: { type: String, default: "" },
+}, { _id: false });
+
+const videoSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  publisher: { type: String, default: "UNKNOWN" },
+  producer: { type: String, default: "UNKNOWN" },
+  genre: { type: String, default: "General" },
+  age: { type: String, default: "PG" },
+  playbackUrl: { type: String, required: true },
+  external: { type: Boolean, default: false },
+  comments: { type: [commentSchema], default: [] },
+  ratings: { type: [Number], default: [] },
+  createdAt: { type: Date, default: Date.now },
+}, { collection: "videos" });
 
 const Video = mongoose.model("Video", videoSchema);
 
-// NEW: Users with self-managed roles
-const userSchema = new mongoose.Schema(
-  {
-    oid: { type: String, required: true, unique: true }, // Entra user OID (or 'sub')
-    email: { type: String, default: "" },
-    name: { type: String, default: "" },
-    role: { type: String, enum: ["Consumer", "Creator"], default: "Consumer" },
-  },
-  { collection: "users", timestamps: true }
-);
+const userSchema = new mongoose.Schema({
+  oid:   { type: String, required: true, unique: true },
+  email: { type: String, default: "" },
+  name:  { type: String, default: "" },
+  role:  { type: String, enum: ["Consumer","Creator"], default: "Consumer" },
+}, { collection: "users", timestamps: true });
+
 const User = mongoose.model("User", userSchema);
 
-// ----- Helpers -----
-const dbState = () =>
-  (
-    [
-      "disconnected",
-      "connected",
-      "connecting",
-      "disconnecting",
-    ][mongoose.connection.readyState] || "unknown"
-  );
-
-const requireCreatorApiKey = (req, res, next) => {
-  if (!CREATOR_API_KEY) return next();
-  if (req.headers["x-api-key"] !== CREATOR_API_KEY)
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  next();
-};
-
+// ---------- Helpers ----------
 const norm = (b = {}) => ({
   title: (b.title || "").trim(),
   publisher: (b.publisher || "").trim(),
@@ -116,38 +118,15 @@ const expose = (v) => ({
   createdAt: v.createdAt,
 });
 
-const isYouTube = (url = "") => /(?:youtube\.com|youtu\.be)/i.test(String(url));
-
-// 🔐 JWT middleware (credentialsRequired=false so public pages still work)
-const jwtCheck = jwt({
-  secret: jwks.expressJwtSecret({
-    cache: true,
-    rateLimit: true,
-    jwksUri: `https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`,
-  }),
-  audience: CLIENT_ID,
-  issuer: `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
-  algorithms: ["RS256"],
-  credentialsRequired: false,
-});
-app.use(jwtCheck);
-
-// Get OID/claims from token (supports both v2 id/access tokens)
 const getAuthInfo = (req) => {
   const a = req.auth || {};
   return {
     oid: a.oid || a.sub || "",
     name: a.name || a.preferred_username || a.unique_name || "",
-    email:
-      a.preferred_username ||
-      a.upn ||
-      a.email ||
-      a.emails?.[0] ||
-      "",
+    email: a.preferred_username || a.upn || a.email || a.emails?.[0] || "",
   };
 };
 
-// Ensure a user document exists (default role = Consumer)
 async function ensureUser(req) {
   const { oid, name, email } = getAuthInfo(req);
   if (!oid) return null;
@@ -155,7 +134,6 @@ async function ensureUser(req) {
   if (!u) {
     u = await User.create({ oid, name, email, role: "Consumer" });
   } else {
-    // light profile refresh
     const patch = {};
     if (name && name !== u.name) patch.name = name;
     if (email && email !== u.email) patch.email = email;
@@ -167,23 +145,32 @@ async function ensureUser(req) {
   return u;
 }
 
-// Role guard using our DB role
 function requireAppRole(role) {
   return async (req, res, next) => {
     const u = await ensureUser(req);
     if (!u) return res.status(401).json({ ok: false, error: "signin required" });
-    if (u.role !== role) {
-      return res
-        .status(403)
-        .json({ ok: false, error: `Forbidden: ${role} role required` });
-    }
+    if (u.role !== role) return res.status(403).json({ ok: false, error: `Forbidden: ${role} role required` });
     next();
   };
 }
 
-// API
-app.get("/health", (_req, res) => res.json({ status: "ok", db: dbState() }));
+// Optional legacy header guard (still supported)
+const requireCreatorApiKey = (req, res, next) => {
+  if (!CREATOR_API_KEY) return next();
+  if (req.headers["x-api-key"] !== CREATOR_API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  next();
+};
 
+// ---------- Routes ----------
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  app: "inspira",
+  db: dbState(),
+  tenantConfigured: !!TENANT_ID,
+  clientConfigured: !!CLIENT_ID
+}));
+
+// Public list
 app.get("/videos", async (_req, res) => {
   try {
     const list = await Video.find().sort({ createdAt: -1 }).lean();
@@ -194,56 +181,36 @@ app.get("/videos", async (_req, res) => {
   }
 });
 
-// -------- Self-switching identities --------
-
-// Current user profile (+auto-provision)
+// Current user (auto-provision)
 app.get("/me", async (req, res) => {
   const u = await ensureUser(req);
   if (!u) return res.status(401).json({ ok: false, error: "signin required" });
-  res.json({
-    ok: true,
-    user: { oid: u.oid, email: u.email, name: u.name, role: u.role },
-  });
+  res.json({ ok: true, user: { oid: u.oid, email: u.email, name: u.name, role: u.role } });
 });
 
-// Switch role (no admin approval)
+// Switch role
 app.post("/me/role", async (req, res) => {
   const u = await ensureUser(req);
   if (!u) return res.status(401).json({ ok: false, error: "signin required" });
 
   const nextRole = String(req.body?.role || "").trim();
   if (!["Consumer", "Creator"].includes(nextRole)) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "role must be 'Consumer' or 'Creator'" });
+    return res.status(400).json({ ok: false, error: "role must be 'Consumer' or 'Creator'" });
   }
-
   if (u.role === nextRole) {
-    return res.json({
-      ok: true,
-      user: { oid: u.oid, email: u.email, name: u.name, role: u.role },
-      changed: false,
-    });
+    return res.json({ ok: true, user: { oid: u.oid, email: u.email, name: u.name, role: u.role }, changed: false });
   }
-
   await User.updateOne({ oid: u.oid }, { $set: { role: nextRole } });
-  return res.json({
-    ok: true,
-    user: { oid: u.oid, email: u.email, name: u.name, role: nextRole },
-    changed: true,
-  });
+  return res.json({ ok: true, user: { oid: u.oid, email: u.email, name: u.name, role: nextRole }, changed: true });
 });
 
-// -------- Videos --------
-
-// CREATE video → our app-managed Creator role
+// Create video (Creator only)
 app.post("/videos", requireAppRole("Creator"), async (req, res) => {
   try {
     const data = norm(req.body);
-    if (!data.title || !data.playbackUrl)
-      return res
-        .status(400)
-        .json({ ok: false, error: "title and playbackUrl required" });
+    if (!data.title || !data.playbackUrl) {
+      return res.status(400).json({ ok: false, error: "title and playbackUrl required" });
+    }
     const doc = await Video.create(data);
     res.status(201).json(expose(doc));
   } catch (e) {
@@ -252,92 +219,60 @@ app.post("/videos", requireAppRole("Creator"), async (req, res) => {
   }
 });
 
-// Comments (kept open so your current UI works; if signed in, we stamp user)
+// Comments (open; stamps user if signed in)
 app.post("/videos/:id/comments", async (req, res) => {
   try {
     const t = (req.body?.text || "").trim();
     if (!t) return res.status(400).json({ ok: false, error: "text required" });
 
-    const info = getAuthInfo(req); // may be empty if not signed in
-    const payload = {
-      text: t,
-      createdAt: new Date(),
-      userId: info.oid || "",
-      userName: info.name || "",
-    };
+    const info = getAuthInfo(req);
+    const payload = { text: t, createdAt: new Date(), userId: info.oid || "", userName: info.name || "" };
 
-    const v = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $push: { comments: payload } },
-      { new: true }
-    );
+    const v = await Video.findByIdAndUpdate(req.params.id, { $push: { comments: payload } }, { new: true });
     if (!v) return res.status(404).json({ ok: false, error: "not found" });
     res.json(expose(v));
   } catch (e) {
-    if (e?.name === "CastError") {
-      return res.status(400).json({ ok: false, error: "invalid id" });
-    }
+    if (e?.name === "CastError") return res.status(400).json({ ok: false, error: "invalid id" });
     console.error("Comment error:", e);
     res.status(500).json({ ok: false, error: "Failed to add comment" });
   }
 });
 
-// Ratings (kept open; later we can require login and 1-per-user)
+// Ratings (open)
 app.post("/videos/:id/ratings", async (req, res) => {
   try {
     const val = Number(req.body?.value);
-    if (!Number.isFinite(val) || val < 1 || val > 5)
-      return res.status(400).json({ ok: false, error: "value must be 1..5" });
-
-    const v = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $push: { ratings: val } },
-      { new: true }
-    );
+    if (!Number.isFinite(val) || val < 1 || val > 5) return res.status(400).json({ ok: false, error: "value must be 1..5" });
+    const v = await Video.findByIdAndUpdate(req.params.id, { $push: { ratings: val } }, { new: true });
     if (!v) return res.status(404).json({ ok: false, error: "not found" });
     res.json(expose(v));
   } catch (e) {
-    if (e?.name === "CastError") {
-      return res.status(400).json({ ok: false, error: "invalid id" });
-    }
+    if (e?.name === "CastError") return res.status(400).json({ ok: false, error: "invalid id" });
     console.error("Rating error:", e);
     res.status(500).json({ ok: false, error: "Failed to add rating" });
   }
 });
 
-/* -----------------------------
-   Deletion endpoints
-------------------------------*/
-
-// delete by id → Creator only
+// Delete single (Creator only)
 app.delete("/videos/:id", requireAppRole("Creator"), async (req, res) => {
   try {
     const v = await Video.findByIdAndDelete(req.params.id);
     if (!v) return res.status(404).json({ ok: false, error: "not found" });
     res.json({ ok: true });
   } catch (e) {
-    if (e?.name === "CastError") {
-      return res.status(400).json({ ok: false, error: "invalid id" });
-    }
+    if (e?.name === "CastError") return res.status(400).json({ ok: false, error: "invalid id" });
     console.error("Delete error:", e);
     res.status(500).json({ ok: false, error: "Failed to delete" });
   }
 });
 
-// bulk purge of YouTube-linked items → Creator only
+// Bulk delete YouTube (Creator only)
 app.delete("/videos", requireAppRole("Creator"), async (req, res) => {
   try {
     if (String(req.query.provider || "").toLowerCase() !== "youtube") {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "unsupported bulk delete; use provider=youtube",
-        });
+      return res.status(400).json({ ok: false, error: "unsupported bulk delete; use provider=youtube" });
     }
-    const r = await Video.deleteMany({
-      playbackUrl: { $regex: /(youtube\.com|youtu\.be)/i },
-    });
+    const r = await Video.deleteMany({ playbackUrl: { $regex: /(youtube\.com|youtu\.be)/i } });
     res.json({ ok: true, deleted: r.deletedCount });
   } catch (e) {
     console.error("Bulk delete error:", e);
@@ -345,33 +280,21 @@ app.delete("/videos", requireAppRole("Creator"), async (req, res) => {
   }
 });
 
-// Static site
-const publicDir = path.join(__dirname, "public");
+// ---------- Static ----------
+const publicDir = path.join(__dirname, STATIC_DIR);
 app.use(express.static(publicDir));
-
-// explicit file routes BEFORE catch-all
 app.get("/", (_req, res) => res.sendFile(path.join(publicDir, "index.html")));
-app.get("/videos.html", (_req, res) =>
-  res.sendFile(path.join(publicDir, "videos.html"))
-);
-app.get("/upload.html", (_req, res) =>
-  res.sendFile(path.join(publicDir, "upload.html"))
-);
-
-// catch-all LAST
+app.get("/videos.html", (_req, res) => res.sendFile(path.join(publicDir, "videos.html")));
+app.get("/upload.html", (_req, res) => res.sendFile(path.join(publicDir, "upload.html")));
 app.get("*", (_req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
-const server = app.listen(PORT, () =>
-  console.log(`✅ Server on :${PORT}`)
-);
+// ---------- Start & Shutdown ----------
+const server = app.listen(PORT, () => console.log(`✅ Inspira server listening on :${PORT}`));
 
-// graceful shutdown
 function shutdown(sig) {
   console.log(`\n${sig} received. Closing...`);
   server.close(async () => {
-    try {
-      await mongoose.disconnect();
-    } catch {}
+    try { await mongoose.disconnect(); } catch {}
     process.exit(0);
   });
 }
